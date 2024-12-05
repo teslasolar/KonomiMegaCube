@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Standalone Cube Server</title>
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
+    <style>
+        :root {
+            --primary-color: #2c3e50;
+            --secondary-color: #34495e;
+            --accent-color: #3498db;
+            --success-color: #2ecc71;
+            --error-color: #e74c3c;
+            --text-color: #ecf0f1;
+        }
+
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: var(--primary-color);
+            color: var(--text-color);
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .header {
+            background-color: var(--secondary-color);
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+
+        .status-panel {
+            background-color: var(--secondary-color);
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+
+        .cube-management {
+            background-color: var(--secondary-color);
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+
+        .mqtt-panel {
+            background-color: var(--secondary-color);
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+
+        .status-indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 10px;
+        }
+
+        .status-connected {
+            background-color: var(--success-color);
+        }
+
+        .status-disconnected {
+            background-color: var(--error-color);
+        }
+
+        button {
+            background-color: var(--accent-color);
+            color: var(--text-color);
+            border: none;
+            padding: 10px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin: 5px;
+        }
+
+        button:hover {
+            opacity: 0.9;
+        }
+
+        .log-panel {
+            background-color: var(--secondary-color);
+            padding: 15px;
+            border-radius: 5px;
+            height: 200px;
+            overflow-y: auto;
+            font-family: monospace;
+        }
+
+        .peer-list {
+            list-style: none;
+            padding: 0;
+        }
+
+        .peer-item {
+            background-color: var(--secondary-color);
+            padding: 10px;
+            margin: 5px 0;
+            border-radius: 3px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Standalone Cube Server</h1>
+            <div>
+                <span class="status-indicator" id="connection-status"></span>
+                <span id="connection-text">Disconnected</span>
+            </div>
+        </div>
+
+        <div class="status-panel">
+            <h2>Instance Information</h2>
+            <p>Instance ID: <span id="instance-id">Generating...</span></p>
+            <p>Status: <span id="instance-status">Initializing...</span></p>
+        </div>
+
+        <div class="cube-management">
+            <h2>Cube Management</h2>
+            <button onclick="createCube()">Create New Cube</button>
+            <button onclick="listCubes()">List Cubes</button>
+            <div id="cube-list"></div>
+        </div>
+
+        <div class="mqtt-panel">
+            <h2>MQTT Communication</h2>
+            <button onclick="connect()">Connect</button>
+            <button onclick="disconnect()">Disconnect</button>
+            <h3>Connected Peers</h3>
+            <ul class="peer-list" id="peer-list"></ul>
+        </div>
+
+        <div class="log-panel" id="log-panel">
+            <!-- Logs will be inserted here -->
+        </div>
+    </div>
+
+    <script>
+        // Generate a unique instance ID
+        const instanceId = 'cube_' + Math.random().toString(36).substr(2, 9);
+        document.getElementById('instance-id').textContent = instanceId;
+
+        // MQTT client setup
+        let client = null;
+        let peers = new Set();
+        
+        // Encryption setup
+        const generateKey = () => {
+            return CryptoJS.lib.WordArray.random(256/8).toString();
+        };
+
+        const encryptMessage = (message, key) => {
+            return CryptoJS.AES.encrypt(JSON.stringify(message), key).toString();
+        };
+
+        const decryptMessage = (encrypted, key) => {
+            const bytes = CryptoJS.AES.decrypt(encrypted, key);
+            return JSON.parse(bytes.toString(CryptoJS.enc.Utf8));
+        };
+
+        // Connection management
+        function connect() {
+            const options = {
+                protocol: 'wss',
+                clientId: instanceId,
+                username: 'cube_user',
+                password: 'cube_password',
+                clean: true,
+                reconnectPeriod: 3000,
+                connectTimeout: 30 * 1000,
+            };
+
+            client = mqtt.connect('wss://broker.hivemq.com:8884/mqtt', options);
+
+            client.on('connect', () => {
+                log('Connected to MQTT broker');
+                updateConnectionStatus(true);
+                subscribeToTopics();
+                announcePresence();
+            });
+
+            client.on('message', (topic, message) => {
+                handleMessage(topic, message);
+            });
+
+            client.on('error', (error) => {
+                log('Connection error: ' + error.message);
+                updateConnectionStatus(false);
+            });
+
+            client.on('close', () => {
+                log('Connection closed');
+                updateConnectionStatus(false);
+            });
+        }
+
+        function disconnect() {
+            if (client) {
+                client.end();
+                updateConnectionStatus(false);
+            }
+        }
+
+        function subscribeToTopics() {
+            client.subscribe('cubes/discovery');
+            client.subscribe(`cubes/${instanceId}/messages`);
+            client.subscribe('cubes/broadcast');
+        }
+
+        function announcePresence() {
+            const message = {
+                type: 'announce',
+                instanceId: instanceId,
+                timestamp: Date.now()
+            };
+            client.publish('cubes/discovery', JSON.stringify(message));
+        }
+
+        function handleMessage(topic, message) {
+            try {
+                const data = JSON.parse(message.toString());
+                log(`Received message on ${topic}: ${JSON.stringify(data)}`);
+
+                if (topic === 'cubes/discovery' && data.type === 'announce') {
+                    if (data.instanceId !== instanceId) {
+                        peers.add(data.instanceId);
+                        updatePeerList();
+                        // Send acknowledgment
+                        sendAcknowledgment(data.instanceId);
+                    }
+                }
+            } catch (error) {
+                log('Error handling message: ' + error.message);
+            }
+        }
+
+        function sendAcknowledgment(peerId) {
+            const message = {
+                type: 'ack',
+                instanceId: instanceId,
+                timestamp: Date.now()
+            };
+            client.publish(`cubes/${peerId}/messages`, JSON.stringify(message));
+        }
+
+        // UI updates
+        function updateConnectionStatus(connected) {
+            const indicator = document.getElementById('connection-status');
+            const text = document.getElementById('connection-text');
+            
+            indicator.className = 'status-indicator ' + 
+                (connected ? 'status-connected' : 'status-disconnected');
+            text.textContent = connected ? 'Connected' : 'Disconnected';
+            
+            document.getElementById('instance-status').textContent = 
+                connected ? 'Active' : 'Inactive';
+        }
+
+        function updatePeerList() {
+            const peerList = document.getElementById('peer-list');
+            peerList.innerHTML = '';
+            peers.forEach(peer => {
+                const li = document.createElement('li');
+                li.className = 'peer-item';
+                li.textContent = peer;
+                peerList.appendChild(li);
+            });
+        }
+
+        function log(message) {
+            const logPanel = document.getElementById('log-panel');
+            const logEntry = document.createElement('div');
+            logEntry.textContent = `[${new Date().toISOString()}] ${message}`;
+            logPanel.appendChild(logEntry);
+            logPanel.scrollTop = logPanel.scrollHeight;
+        }
+
+        // Cube management
+        async function createCube() {
+            const cubeName = prompt('Enter cube name:');
+            if (cubeName) {
+                // Implementation will be added
+                log(`Creating cube: ${cubeName}`);
+            }
+        }
+
+        function listCubes() {
+            // Implementation will be added
+            log('Listing cubes...');
+        }
+
+        // Initialize on load
+        document.addEventListener('DOMContentLoaded', () => {
+            log('Standalone cube server initialized');
+            updateConnectionStatus(false);
+        });
+    </script>
+</body>
+</html>
